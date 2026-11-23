@@ -333,6 +333,23 @@
                 android:clipToPadding="false"
                 android:orientation="horizontal">
 
+                <!-- Memory and weather pills (config memory_pill, weather_pill), filled in by MainActivity. -->
+                <TextView
+                    android:id="@+id/btnMemory"
+                    style="@style/TopButton"
+                    android:visibility="gone"
+                    android:singleLine="true"
+                    android:fontFeatureSettings="tnum"
+                    android:drawableStart="@drawable/ic_memory"
+                    android:nextFocusDown="@+id/grid" />
+
+                <TextView
+                    android:id="@+id/btnWeather"
+                    style="@style/TopButton"
+                    android:visibility="gone"
+                    android:singleLine="true"
+                    android:nextFocusDown="@+id/grid" />
+
                 <TextView
                     android:id="@+id/btnInputs"
                     style="@style/TopButton"

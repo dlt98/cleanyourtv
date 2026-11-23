@@ -836,6 +836,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         btnSettings.setOnClickListener(v -> {
             if (launcherSettingsButton) startActivityForResult(
                     new Intent(this, LauncherSettingsActivity.class), LAUNCHER_SETTINGS_REQUEST);
+            else if (settingsKeyPanel) open(new Intent(this, QuickSettingsActivity.class));
             else open(systemIntent(Settings.ACTION_SETTINGS));
         });
         btnReorder = findViewById(R.id.btnReorder);
@@ -850,6 +851,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             libraryFromTopBar = true;   // closing it goes back to this button, not to the pill after the last row
         });
         btnLibraryTop.setVisibility(cfg.libraryButton && cfg.appLibrary ? View.VISIBLE : View.GONE);
+        setUpStatusPills();
         addTopBarApps(cfg.topBarApps, cfg.launchActions);
         iconOnlyButtons = cfg.iconOnlyButtons;
         topMenu = cfg.topMenu;
@@ -921,9 +923,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         btnReorder.setOnKeyListener(pillKeys);
         btnLibraryTop.setOnKeyListener(pillKeys);
         for (View button : topAppButtons) button.setOnKeyListener(pillKeys);
+        for (View button : statusPills()) button.setOnKeyListener(pillKeys);
         if (advancedEffects) {
             List<View> pills = new ArrayList<>(Arrays.asList(btnInputs, btnWifi, btnVpn, btnReorder, btnLibraryTop, btnSettings));
             pills.addAll(topAppButtons);
+            pills.addAll(statusPills());
             for (View button : pills) {
                 button.setOnFocusChangeListener((view, focused) -> view.animate()
                         .scaleX(focused ? 1.04f : 1f).scaleY(focused ? 1.04f : 1f)
@@ -1137,6 +1141,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             pillsShown = true;
         }
         if (showStats) startStats();
+        startPills();
         if (gameDay != null) gameDay.start();
         sky.update();
         wallpaperPlayer.start();
@@ -1322,6 +1327,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         handler.removeCallbacks(openWhenOnline);
         startPending = null;   // leaving Home before the network came back: the boot's app stays closed
         stopStats();
+        stopPills();
         if (gameDay != null) gameDay.stop();
         handler.removeCallbacks(turnTick);
         if (lamp != null) lamp.stop();
@@ -3687,6 +3693,253 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         return row;
     }
 
+    // ---- status pills: memory and weather, and the bloatware list ---------------------------------
+
+    /** config memory_pill / weather_pill; null in a layout without them (Hebrew). */
+    private TextView btnMemory, btnWeather;
+    /** Background reader for both pills, running while Home is resumed (volatile: read off-thread). */
+    private HandlerThread pillThread;
+    private volatile Handler pillBg;
+    /** The last forecast; kept across pauses so the popup opens at once. */
+    private Weather.Report weather;
+    /** elapsedRealtime of the last weather fetch, successful or not (pill thread only). */
+    private volatile long weatherFetchedAt = -WEATHER_MS;
+    private static final long PILL_MS = 10_000L, WEATHER_MS = 30 * 60_000L, WEATHER_RETRY_MS = 2 * 60_000L;
+
+    private void setUpStatusPills() {
+        btnMemory = findViewById(R.id.btnMemory);
+        btnWeather = findViewById(R.id.btnWeather);
+        if (btnMemory != null && getResources().getBoolean(R.bool.memory_pill)) {
+            btnMemory.setVisibility(View.VISIBLE);
+            btnMemory.setText(getString(R.string.memory_pill, 0).replace("0", "–"));
+            btnMemory.setOnClickListener(v -> showRunningApps());
+        }
+        if (btnWeather != null && getResources().getBoolean(R.bool.weather_pill) && weatherLocation() != null) {
+            btnWeather.setVisibility(View.VISIBLE);
+            btnWeather.setText("–°");
+            btnWeather.setOnClickListener(v -> showForecast());
+            if (weather != null) showWeather(weather);
+        }
+    }
+
+    private List<View> statusPills() {
+        List<View> pills = new ArrayList<>();
+        if (btnMemory != null && btnMemory.getVisibility() == View.VISIBLE) pills.add(btnMemory);
+        if (btnWeather != null && btnWeather.getVisibility() == View.VISIBLE) pills.add(btnWeather);
+        return pills;
+    }
+
+    /** {latitude, longitude} from local.properties (app/build.gradle), or null when either is missing or not a number. */
+    private double[] weatherLocation() {
+        try {
+            return new double[]{Double.parseDouble(getString(R.string.weather_latitude)),
+                    Double.parseDouble(getString(R.string.weather_longitude))};
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private void startPills() {
+        if (pillThread != null || statusPills().isEmpty()) return;
+        boolean memoryOn = btnMemory != null && btnMemory.getVisibility() == View.VISIBLE;
+        double[] location = btnWeather != null && btnWeather.getVisibility() == View.VISIBLE ? weatherLocation() : null;
+        pillThread = new HandlerThread("pills");
+        pillThread.start();
+        Handler bg = new Handler(pillThread.getLooper());
+        pillBg = bg;
+        bg.post(new Runnable() {
+            @Override
+            public void run() {
+                if (pillBg != bg) return;
+                long[] mem = memoryOn ? memUsedOfTotalMb() : null;
+                Weather.Report report = null;
+                long now = SystemClock.elapsedRealtime();
+                if (location != null && now - weatherFetchedAt >= WEATHER_MS) {
+                    report = fetchWeather(location);
+                    // A failed fetch (no network yet after boot) tries again in two minutes, not in half an hour.
+                    weatherFetchedAt = report != null ? now : now - WEATHER_MS + WEATHER_RETRY_MS;
+                }
+                Weather.Report fresh = report;
+                handler.post(() -> {
+                    if (pillBg != bg) return;
+                    if (mem != null && mem[1] > 0) {
+                        btnMemory.setText(getString(R.string.memory_pill, Math.round(mem[0] * 100f / mem[1])));
+                    }
+                    if (fresh != null) showWeather(fresh);
+                });
+                if (pillBg == bg) bg.postDelayed(this, PILL_MS);
+            }
+        });
+    }
+
+    private void stopPills() {
+        if (pillThread == null) return;
+        pillBg.removeCallbacksAndMessages(null);
+        pillThread.quit();
+        pillThread = null;
+        pillBg = null;
+    }
+
+    /** One Open-Meteo request on the pill thread; null on any failure. */
+    private static Weather.Report fetchWeather(double[] location) {
+        java.net.HttpURLConnection c = null;
+        try {
+            c = (java.net.HttpURLConnection) new java.net.URL(Weather.url(location[0], location[1])).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            if (c.getResponseCode() != 200) return null;
+            StringBuilder body = new StringBuilder();
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(
+                    c.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
+                for (String line; (line = r.readLine()) != null;) body.append(line);
+            }
+            return Weather.parse(body.toString());
+        } catch (java.io.IOException | org.json.JSONException | RuntimeException e) {
+            android.util.Log.w("TvHome.Weather", "Weather fetch failed", e);
+            return null;
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
+    private void showWeather(Weather.Report report) {
+        weather = report;
+        if (btnWeather == null) return;
+        btnWeather.setText(getString(R.string.weather_now, Weather.emoji(report.code, report.day), report.temp));
+        btnWeather.setContentDescription(Weather.label(report.code) + ", " + report.temp + "°");
+    }
+
+    /** A scrolling glass list under (or, without an anchor, centred on) the screen, header text set. */
+    private PopupWindow listPopup(View panel, String header) {
+        ((TextView) panel.findViewById(R.id.header)).setText(header);
+        return glassPopup(panel, (int) (320 * density));
+    }
+
+    /** Sizes the list to fit the screen below the anchor, then drops it in under the anchor's end. */
+    private void showListUnder(PopupWindow popup, View panel, View anchor) {
+        panel.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+        popup.setWidth(Math.max((int) (320 * density), Math.min(panel.getMeasuredWidth(), (int) (420 * density))));
+        int[] at = new int[2];
+        anchor.getLocationInWindow(at);
+        int room = root.getHeight() - (at[1] + anchor.getHeight()) - (int) (34 * density);
+        popup.setHeight(Math.min(panel.getMeasuredHeight(), Math.max(room, (int) (120 * density))));
+        dropIn(popup, panel, anchor, Gravity.END);
+    }
+
+    /** A plain row: title left, status right, optional icon (drawn in its own colours). */
+    private View addListRow(LinearLayout rows, Drawable icon, CharSequence title, CharSequence status, Runnable action) {
+        View row = getLayoutInflater().inflate(R.layout.item_input, rows, false);
+        ImageView iconView = row.findViewById(R.id.icon);
+        if (icon != null) {
+            iconView.setImageTintList(null);
+            iconView.setImageDrawable(icon);
+        } else {
+            iconView.setVisibility(View.GONE);
+        }
+        ((TextView) row.findViewById(R.id.title)).setText(title);
+        row.findViewById(R.id.dot).setVisibility(View.GONE);
+        TextView statusView = row.findViewById(R.id.status);
+        if (TextUtils.isEmpty(status)) statusView.setVisibility(View.GONE);
+        else statusView.setText(status);
+        if (action != null) row.setOnClickListener(v -> action.run());
+        rows.addView(row);
+        return row;
+    }
+
+    /** The weather pill: now, then each hour left today. */
+    private void showForecast() {
+        if (weather == null) {
+            Toast.makeText(this, R.string.weather_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        View panel = getLayoutInflater().inflate(R.layout.popup_list, root, false);
+        LinearLayout rows = panel.findViewById(R.id.rows);
+        PopupWindow popup = listPopup(panel, Weather.label(weather.code) + "  ·  " + weather.temp + "°");
+        for (Weather.Hour h : weather.hours) {
+            // The emoji sits with the temperature at the right edge: emoji widths differ, and in the title they
+            // pushed each row's label to a different x.
+            String status = (h.rainChance > 0 ? getString(R.string.weather_rain, h.rainChance) + "    " : "")
+                    + Weather.emoji(h.code, h.day) + "  " + h.temp + "°";
+            addListRow(rows, null, h.time + "    " + Weather.label(h.code), status, popup::dismiss);
+        }
+        showListUnder(popup, panel, btnWeather);
+        if (rows.getChildCount() > 0) rows.getChildAt(0).requestFocus();
+    }
+
+    /** The memory pill: the apps that have a process now; a row opens the app's App info to force-stop it. */
+    private void showRunningApps() {
+        new Thread(() -> {
+            List<String> running = RunningApps.read();
+            long[] mem = memUsedOfTotalMb();
+            handler.post(() -> {
+                if (!resumed || isFinishing()) return;
+                View panel = getLayoutInflater().inflate(R.layout.popup_list, root, false);
+                LinearLayout rows = panel.findViewById(R.id.rows);
+                PopupWindow popup = listPopup(panel, mem == null ? "" : getString(R.string.memory_title, mem[0], mem[1]));
+                PackageManager pm = getPackageManager();
+                for (String pkg : running) {
+                    if (pkg.equals(getPackageName())) continue;
+                    Intent launch = pm.getLeanbackLaunchIntentForPackage(pkg);
+                    if (launch == null) launch = pm.getLaunchIntentForPackage(pkg);
+                    Intent info = SystemSettings.appInfo(this, pkg);
+                    if (launch == null || info == null) continue;   // services and system parts, not apps
+                    try {
+                        ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                        // The TV's own parts (Settings, the Input key's panel) run as the system user: not apps to close.
+                        if (ai.uid == android.os.Process.SYSTEM_UID) continue;
+                        addListRow(rows, pm.getApplicationIcon(ai), pm.getApplicationLabel(ai),
+                                getString(R.string.running_close) + "  ✕", () -> {
+                                    popup.dismiss();
+                                    open(info);
+                                });
+                    } catch (PackageManager.NameNotFoundException ignored) {
+                    }
+                }
+                if (rows.getChildCount() == 0) {
+                    addListRow(rows, null, getString(running.isEmpty() ? R.string.running_no_access : R.string.running_none),
+                            null, popup::dismiss);
+                }
+                showListUnder(popup, panel, btnMemory);
+                rows.getChildAt(0).requestFocus();
+            });
+        }, "running-apps").start();
+    }
+
+    /** The footer button while apps are tagged: OK on a row opens the app, holding OK takes the tag off. */
+    @Override
+    public void onBloatwareRequested() {
+        List<AppAdapter.Entry> apps = adapter.bloatware();
+        if (apps.isEmpty()) return;
+        View panel = getLayoutInflater().inflate(R.layout.popup_list, root, false);
+        LinearLayout rows = panel.findViewById(R.id.rows);
+        PopupWindow popup = listPopup(panel, getString(R.string.bloatware_title) + "  ·  " + getString(R.string.bloatware_hint));
+        for (AppAdapter.Entry e : apps) {
+            View row = addListRow(rows, e.icon, e.label, null, () -> {
+                popup.dismiss();
+                Intent i = new Intent(Intent.ACTION_MAIN).setComponent(e.component)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                open(i);
+            });
+            row.setOnLongClickListener(v -> {
+                popup.dismiss();
+                Bloatware.set(this, e.pkg, false);
+                Toast.makeText(this, e.label + ": " + getString(R.string.tile_unmark_bloatware), Toast.LENGTH_SHORT).show();
+                reloadApps(false);
+                // The footer button that had focus may be gone now: put focus on the app back in the grid.
+                root.post(() -> {
+                    int at = adapter.positionOf(e.component.flattenToShortString());
+                    if (at >= 0) focusTile(at);
+                });
+                return true;
+            });
+        }
+        panel.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+        popup.setWidth((int) (360 * density));
+        popup.setHeight(Math.min(panel.getMeasuredHeight(), root.getHeight() - (int) (160 * density)));
+        popup.showAtLocation(root, Gravity.CENTER, 0, 0);
+        rows.getChildAt(0).requestFocus();
+    }
+
     // ---- launcher settings and module cards -------------------------------------------------------
 
     /** top_menu: the gear's dropdown, standing in for the Inputs, Wi-Fi and Settings pills. */
@@ -3864,6 +4117,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             focusTile(at);
             pickUp(at);
             Toast.makeText(this, R.string.reorder_hint, Toast.LENGTH_LONG).show();
+        });
+        addSettingsMenuRow(rows, popup, R.string.tile_mark_bloatware, () -> {
+            Bloatware.set(this, pkg, true);
+            reloadApps(false);
         });
         if (appLibraryEnabled) addSettingsMenuRow(rows, popup, R.string.library_remove_shortcut, () -> {
             if (LibraryApps.save(this, pkg, false)) reloadApps(false);

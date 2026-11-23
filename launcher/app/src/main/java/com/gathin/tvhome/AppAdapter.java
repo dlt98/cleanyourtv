@@ -57,6 +57,8 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         boolean onTileVerticalKey(int position, int keyCode);
 
         void onLibraryRequested();
+        /** The footer button when it stands for the apps tagged as bloatware (Bloatware), not the App library. */
+        void onBloatwareRequested();
         void onLibraryFocused();
         /** Hold OK on a tile: the activity shows the tile menu (move, remove from Home, app info). */
         void onTileLongPress(int position, View card);
@@ -221,6 +223,8 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
     /** Packages drawn from their icon and name even when they have a banner (config.xml icon_tiles). */
     private final Set<String> iconTiles;
     private final List<Entry> items = new ArrayList<>();
+    /** Apps tagged as bloatware at the last reload(): kept out of the grid, listed behind the footer button. */
+    private final List<Entry> bloat = new ArrayList<>();
 
     AppAdapter(Context ctx, TileListener listener, int dockSize, Config cfg) {
         this.ctx = ctx;
@@ -269,6 +273,8 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         Set<String> added = new HashSet<>(LibraryApps.load(ctx));
         added.addAll(libraryPreload);
         Set<String> removed = LibraryApps.loadRemoved(ctx);
+        Set<String> bloatPackages = reordering ? Collections.emptySet() : Bloatware.load(ctx);
+        List<Entry> freshBloat = new ArrayList<>();
         if (!added.isEmpty()) {
             Set<String> seen = new HashSet<>(tvPackages);
             for (ResolveInfo ri : pm.queryIntentActivities(
@@ -296,6 +302,10 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             String label = card != null ? card.label : Cards.cleanLabel(
                     appLabels.containsKey(pkg) ? appLabels.get(pkg) : String.valueOf(ri.loadLabel(pm)), pkg);
             if (!seen.add(pkg + '\n' + label)) continue;
+            if (bloatPackages.contains(pkg)) {
+                freshBloat.add(new Entry(label, component, null, ri.loadIcon(pm)));
+                continue;
+            }
             Drawable banner = null;
             // uniform_tiles draws the icon, so an app's banner is never loaded. A module card keeps its banner.
             if (!(uniformTiles && card == null)) {
@@ -342,6 +352,9 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         }
         items.clear();
         items.addAll(fresh);
+        Collections.sort(freshBloat, (a, b) -> a.label.compareToIgnoreCase(b.label));
+        bloat.clear();
+        bloat.addAll(freshBloat);
         notifyDataSetChanged();
     }
 
@@ -401,7 +414,10 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         if (viewType == 1) {
             View row = LayoutInflater.from(ctx).inflate(R.layout.row_app_library, parent, false);
             View button = row.findViewById(R.id.btnLibrary);
-            button.setOnClickListener(v -> listener.onLibraryRequested());
+            button.setOnClickListener(v -> {
+                if (showLibrary) listener.onLibraryRequested();
+                else listener.onBloatwareRequested();
+            });
             button.setOnFocusChangeListener((v, focused) -> { if (focused) listener.onLibraryFocused(); });
             button.setOnKeyListener((v, key, event) -> {
                 if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
@@ -458,7 +474,13 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
     @Override
     @SuppressWarnings("deprecation")
     public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position) {
-        if (isLibraryAt(position)) return;
+        if (isLibraryAt(position)) {
+            if (!showLibrary) {
+                TextView button = holder.itemView.findViewById(R.id.btnLibrary);
+                button.setText(ctx.getString(R.string.bloatware_button, bloat.size()));
+            }
+            return;
+        }
         Holder h = (Holder) holder;
         Entry e = items.get(position);
         if (e.kind == Entry.EMPTY) {
@@ -565,12 +587,18 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
 
     @Override
     public int getItemCount() {
-        return items.size() + (showLibrary ? 1 : 0);
+        return items.size() + (hasFooter() ? 1 : 0);
     }
 
     int appCount() { return items.size(); }
 
-    boolean isLibraryAt(int position) { return showLibrary && position == items.size(); }
+    boolean isLibraryAt(int position) { return hasFooter() && position == items.size(); }
+
+    /** The footer button: the App library, or else the bloatware list while any app is tagged. */
+    private boolean hasFooter() { return showLibrary || !bloat.isEmpty(); }
+
+    /** Apps tagged as bloatware, by name (label, component, icon). */
+    List<Entry> bloatware() { return bloat; }
 
     @Override public int getItemViewType(int position) { return isLibraryAt(position) ? 1 : 0; }
 
